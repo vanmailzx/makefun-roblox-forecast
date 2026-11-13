@@ -42,6 +42,47 @@ LAM_MID = 0.0060
 LAM_LOW = 0.0080
 MAX_RANK = 97
 CHART_MAX_AGE_DAYS = 28.0
+# Cap on named mass per place: stop naming once named_sum reaches this, so a
+# reserve of (1 - NAMED_CAP) stays as unnamed mass for games not in the last
+# chart (new entrants). Without it, flat long-horizon distributions name ~all
+# 96 games per place (sums 1.0) and every new game floors at 1e-4. 1.0 = off.
+NAMED_CAP = 0.8
+# Per-game recent rank velocity blended into the Gaussian drift: mu =
+# VEL_W * v + (1 - VEL_W) * prior_drift, v = half-life-weighted rank slope
+# (places/hour, clipped to [-2, 2]). 0.0 = off (pure prior drift).
+VEL_W = 0.0
+VEL_HL = 36.0
+# Recency weighting of empirical pair counts: pairs ending tj get weight
+# 0.5 ** ((t_last - tj) / RECENCY_HL). None = off (all pairs equal weight).
+RECENCY_HL = None
+# Per-place unnamed reserve slope in the Gaussian normalization:
+# reserve(k) = UNNAMED_RESERVE + UNNAMED_SLOPE * (k - 5.5) / 4.5, clipped
+# to [0.02, 0.4]. 0.0 = flat reserve for all places.
+UNNAMED_SLOPE = 0.0
+
+
+def fit_velocity(points, t_now, half_life_h=36.0, min_pts=2):
+    if len(points) < min_pts:
+        return None, 0
+    xs, ys, ws = [], [], []
+    for t, r in points:
+        age = t_now - t
+        if age < 0 or age > 240:
+            continue
+        w = 0.5 ** (age / half_life_h)
+        xs.append(t)
+        ys.append(r)
+        ws.append(w)
+    if len(xs) < min_pts:
+        return None, 0
+    sw = sum(ws)
+    mx = sum(w * x for w, x in zip(ws, xs)) / sw
+    my = sum(w * y for w, y in zip(ws, ys)) / sw
+    sxx = sum(w * (x - mx) ** 2 for w, x in zip(ws, xs))
+    if sxx < 1e-9:
+        return None, 0
+    v = sum(w * (x - mx) * (y - my) for w, x, y in zip(ws, xs, ys)) / sxx
+    return max(-2.0, min(2.0, v)), len(xs)
 
 # Fitted place-occupancy table for the PRACTICE window only (10 published reads
 # 2026-11-08T00:37Z..2026-11-10T17:51Z, archive Kenny-Dhub/roblox-snapshots).
@@ -151,12 +192,23 @@ def gauss_prob(snaps, task, age_out):
     places = int(task["places"])
 
     games = []
+    traj = {}
+    if VEL_W > 0.0:
+        for s in snaps:
+            t = parse_ts(s["at"]).timestamp() / 3600.0
+            for r in s["up_and_coming"]:
+                traj.setdefault(int(r["universe_id"]), []).append((t, int(r["rank"])))
     for row in last_chart:
         r0 = int(row["rank"])
         if r0 > MAX_RANK:
             continue
         g = int(row["universe_id"])
         mu = prior_drift(r0) * DRIFT_SCALE
+        if VEL_W > 0.0:
+            v, npts = fit_velocity(traj.get(g, []), t_now, half_life_h=VEL_HL)
+            if v is not None:
+                w = VEL_W * npts / (npts + 2.0)
+                mu = w * v + (1 - w) * mu
         sig = prior_sigma(r0) * SIG_SCALE
         lam = LAM_TOP if r0 <= 10 else (LAM_MID if r0 <= 40 else LAM_LOW)
         games.append((g, r0, mu, sig, lam))
@@ -184,7 +236,10 @@ def gauss_prob(snaps, task, age_out):
                     sums[k] += p
         for (g, k), p in w.items():
             if sums[k] > 0:
-                prob[g][k] += (p / sums[k]) * (1.0 - UNNAMED_RESERVE) / slots
+                reserve = UNNAMED_RESERVE
+                if UNNAMED_SLOPE != 0.0:
+                    reserve = min(0.4, max(0.02, UNNAMED_RESERVE + UNNAMED_SLOPE * (k - 5.5) / 4.5))
+                prob[g][k] += (p / sums[k]) * (1.0 - reserve) / slots
     return prob
 
 
@@ -230,6 +285,7 @@ def dest_bucket(rank):
 def build_tables(snaps):
     counts = {}
     n = len(snaps)
+    t_last = parse_ts(snaps[-1]["at"]).timestamp() / 3600.0
     for i in range(n):
         ti = parse_ts(snaps[i]["at"]).timestamp() / 3600.0
         mi = {int(r["universe_id"]): int(r["rank"]) for r in snaps[i]["up_and_coming"]}
@@ -242,11 +298,14 @@ def build_tables(snaps):
                      if HORIZON_EDGES[b] <= dt < HORIZON_EDGES[b + 1])
             mj = {int(r["universe_id"]): int(r["rank"]) for r in snaps[j]["up_and_coming"]}
             tab = counts.setdefault(h, {})
+            wgt = 1.0
+            if RECENCY_HL:
+                wgt = 0.5 ** ((t_last - tj) / RECENCY_HL)
             for g, r in mi.items():
                 sg = start_group(r)
                 d = dest_bucket(mj.get(g))
                 row = tab.setdefault(sg, {})
-                row[d] = row.get(d, 0) + 1
+                row[d] = row.get(d, 0) + wgt
     return counts
 
 
@@ -385,9 +444,10 @@ def build_forecast(snaps, task):
             chosen.append((g, p))
             named_sum += p
             named_n += 1
-        if named_sum > 1.0:
-            scale = 0.999999 / named_sum
+        if named_sum > NAMED_CAP:
+            scale = NAMED_CAP / named_sum
             chosen = [(g, p * scale) for g, p in chosen]
+            named_sum = NAMED_CAP
         for g, p in chosen:
             rows.append({"universe_id": g, "place": k, "p": math.floor(p * 1e6) / 1e6})
         if chosen:
